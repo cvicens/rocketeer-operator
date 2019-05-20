@@ -3,6 +3,7 @@ package configuration
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
 
@@ -31,24 +32,9 @@ import (
 )
 
 var log = logf.Log.WithName("controller_configuration")
-var deployment = `
-apiVersion: extensions/v1beta1
-kind: Deployment
-metadata:
-name: my-nginx
-spec:
-replicas: 2
-template:
-  metadata:
-    labels:
-      run: my-nginx
-  spec:
-    containers:
-    - name: my-nginx
-      image: nginx
-      ports:
-      - containerPort: 80
-`
+
+const GIT_LOCAL_FOLDER = "./tmp"
+const DEFAULT_DESCRIPTORS_FOLDER = "k8s"
 
 /**
 * USER ACTION REQUIRED: This is a scaffold file intended for the user to modify with their own Controller
@@ -129,6 +115,9 @@ func (r *ReconcileConfiguration) Reconcile(request reconcile.Request) (reconcile
 		return reconcile.Result{}, err
 	}
 
+	var descriptorsFolder = NVL(instance.Spec.DescriptorsFolder, DEFAULT_DESCRIPTORS_FOLDER)
+	var descriptorsFolderPath = fmt.Sprintf("%s/%s/", GIT_LOCAL_FOLDER, descriptorsFolder)
+
 	configMapList := &v1.ConfigMapList{}
 	if err := getAllConfigMaps(r, request, configMapList); err != nil {
 		return reconcile.Result{}, err
@@ -140,7 +129,7 @@ func (r *ReconcileConfiguration) Reconcile(request reconcile.Request) (reconcile
 	}
 
 	// Apply all configmaps
-	applyAllFilesInFolder(r, request)
+	applyAllFilesInFolder(r, request, descriptorsFolderPath)
 
 	// Define a new Pod object
 	pod := newPodForCR(instance)
@@ -207,23 +196,23 @@ func getAllConfigMaps(r *ReconcileConfiguration, request reconcile.Request, conf
 }
 
 func cloneRepository(url string, ref string) (*git.Repository, error) {
-	if repo, err := git.PlainOpen("./tmp"); err == nil {
+	if repo, err := git.PlainOpen(GIT_LOCAL_FOLDER); err == nil {
 		if w, err := repo.Worktree(); err == nil {
 			if err := w.Pull(&git.PullOptions{RemoteName: "origin"}); err == nil || err.Error() == "already up-to-date" {
 				return repo, nil
 			} else {
-				os.RemoveAll("./tmp")
+				os.RemoveAll(GIT_LOCAL_FOLDER)
 				return nil, err
 			}
 		} else {
-			os.RemoveAll("./tmp")
+			os.RemoveAll(GIT_LOCAL_FOLDER)
 			return nil, err
 		}
 	} else {
 		// Delete just in case
-		os.RemoveAll("./tmp")
+		os.RemoveAll(GIT_LOCAL_FOLDER)
 		// Clone
-		repo, err := git.PlainClone("./tmp", false, &git.CloneOptions{
+		repo, err := git.PlainClone(GIT_LOCAL_FOLDER, false, &git.CloneOptions{
 			URL:               url,
 			ReferenceName:     plumbing.ReferenceName("refs/heads/" + ref),
 			RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
@@ -232,14 +221,13 @@ func cloneRepository(url string, ref string) (*git.Repository, error) {
 	}
 }
 
-func applyAllFilesInFolder(r *ReconcileConfiguration, request reconcile.Request) error {
-	// readi file...
+func applyAllFilesInFolder(r *ReconcileConfiguration, request reconcile.Request, folder string) error {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 
-	if files, err := ioutil.ReadDir("./tmp/k8s/"); err == nil {
+	if files, err := ioutil.ReadDir(folder); err == nil {
 		for _, f := range files {
-			reqLogger.Info("file: " + f.Name())
-			if b, err := ioutil.ReadFile("./tmp/k8s/" + f.Name()); err == nil {
+			reqLogger.Info("current file: " + f.Name())
+			if b, err := ioutil.ReadFile(folder + f.Name()); err == nil {
 				typeMeta := &metav1.TypeMeta{}
 				if err := yaml.Unmarshal([]byte(b), &typeMeta); err == nil {
 					reqLogger.Info("typeMeta: " + typeMeta.String())
@@ -253,31 +241,20 @@ func applyAllFilesInFolder(r *ReconcileConfiguration, request reconcile.Request)
 							reqLogger.Info("===== isConfigMap =====")
 							configMap := &v1.ConfigMap{}
 							configMap.Namespace = request.Namespace
-							//configMap := make(map[interface{}]interface{})
-							//configMap.TypeMeta = *typeMeta
-							//configMap.ObjectMeta = *objectMeta
-							//configMap.TypeMeta = metav1.TypeMeta{}
-							//configMap.ObjectMeta = metav1.ObjectMeta{}
 							dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader([]byte(b)), 1000)
 							if err := dec.Decode(&configMap); err == nil {
-								//if err := yaml.Unmarshal([]byte(b), &configMap); err == nil {
-								//if err := configMap.Unmarshal([]byte(b)); err == nil {
 								reqLogger.Info("configMap", "name", objectMeta.Name, "data", configMap.String())
 
 								aux := &v1.ConfigMap{}
-								if err := r.client.Get(context.TODO(), types.NamespacedName{Name: configMap.Name, Namespace: configMap.Namespace}, aux); err != nil {
-									reqLogger.Info("Get ConfigMap err: " + err.Error())
-								} else {
-									reqLogger.Info("Get ConfigMap success!!" + aux.String())
-								}
-
-								if err := r.client.Create(context.TODO(), configMap); err != nil {
-									reqLogger.Info("Create ConfigMap err: " + err.Error())
+								if err := r.client.Get(context.TODO(), types.NamespacedName{Name: configMap.Name, Namespace: configMap.Namespace}, aux); err == nil {
 									if err := r.client.Update(context.TODO(), configMap); err != nil {
 										reqLogger.Info("Update ConfigMap err: " + err.Error())
 									}
+								} else {
+									if err := r.client.Create(context.TODO(), configMap); err != nil {
+										reqLogger.Info("Create ConfigMap err: " + err.Error())
+									}
 								}
-
 							} else {
 								reqLogger.Info("Unmarshal configMap err: " + err.Error())
 							}
@@ -350,4 +327,11 @@ func applyAllFilesInFolder(r *ReconcileConfiguration, request reconcile.Request)
 	}
 
 	return err*/
+}
+
+func NVL(str string, def string) string {
+	if len(str) == 0 {
+		return def
+	}
+	return str
 }
