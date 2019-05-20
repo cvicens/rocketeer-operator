@@ -1,0 +1,7 @@
+apiVersion: app.rocketeer.com/v1alpha1
+kind: Configuration
+metadata:
+  name: example-configuration
+spec:
+  gitUrl: "https://github.com/cvicens/archetype-operator-customer-service.git"
+  gitRef: "master"
