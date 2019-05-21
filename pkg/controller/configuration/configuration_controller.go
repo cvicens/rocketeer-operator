@@ -3,11 +3,18 @@ package configuration
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strconv"
+
+	cmp "github.com/google/go-cmp/cmp"
 
 	appv1alpha1 "github.com/cvicens/rocketeer-operator/pkg/apis/app/v1alpha1"
+	"github.com/go-logr/logr"
 	yaml "gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
@@ -15,6 +22,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+
+	appsv1 "k8s.io/api/apps/v1"
+
+	oappsv1 "github.com/openshift/api/apps/v1"
+	buildv1 "github.com/openshift/api/build/v1"
+	imagev1 "github.com/openshift/api/image/v1"
+	routev1 "github.com/openshift/api/route/v1"
 
 	k8s_yaml "k8s.io/apimachinery/pkg/util/yaml"
 
@@ -49,7 +63,12 @@ func Add(mgr manager.Manager) error {
 
 // newReconciler returns a new reconcile.Reconciler
 func newReconciler(mgr manager.Manager) reconcile.Reconciler {
-	return &ReconcileConfiguration{client: mgr.GetClient(), scheme: mgr.GetScheme()}
+	scheme := mgr.GetScheme()
+	oappsv1.AddToScheme(scheme)
+	imagev1.AddToScheme(scheme)
+	routev1.AddToScheme(scheme)
+	buildv1.AddToScheme(scheme)
+	return &ReconcileConfiguration{client: mgr.GetClient(), scheme: scheme}
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
@@ -115,21 +134,20 @@ func (r *ReconcileConfiguration) Reconcile(request reconcile.Request) (reconcile
 		return reconcile.Result{}, err
 	}
 
-	var descriptorsFolder = NVL(instance.Spec.DescriptorsFolder, DEFAULT_DESCRIPTORS_FOLDER)
+	var descriptorsFolder = nvl(instance.Spec.DescriptorsFolder, DEFAULT_DESCRIPTORS_FOLDER)
 	var descriptorsFolderPath = fmt.Sprintf("%s/%s/", GIT_LOCAL_FOLDER, descriptorsFolder)
 
 	configMapList := &v1.ConfigMapList{}
 	if err := getAllConfigMaps(r, request, configMapList); err != nil {
 		return reconcile.Result{}, err
 	}
-	//reqLogger.Info("getAllConfigMaps", "configmapList.Items", configMapList.Items)
 
 	if _, err := cloneRepository(instance.Spec.GitUrl, instance.Spec.GitRef); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// Apply all configmaps
-	applyAllFilesInFolder(r, request, descriptorsFolderPath)
+	// Apply all descriptors
+	applyDescriptorsInFolder(r, request, descriptorsFolderPath)
 
 	// Define a new Pod object
 	pod := newPodForCR(instance)
@@ -221,7 +239,7 @@ func cloneRepository(url string, ref string) (*git.Repository, error) {
 	}
 }
 
-func applyAllFilesInFolder(r *ReconcileConfiguration, request reconcile.Request, folder string) error {
+func applyDescriptorsInFolder(r *ReconcileConfiguration, request reconcile.Request, folder string) error {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 
 	if files, err := ioutil.ReadDir(folder); err == nil {
@@ -238,34 +256,21 @@ func applyAllFilesInFolder(r *ReconcileConfiguration, request reconcile.Request,
 						reqLogger.Info("objectMeta: " + objectMeta.String())
 						switch kind := typeMeta.GetObjectKind().GroupVersionKind().Kind; kind {
 						case "ConfigMap":
-							reqLogger.Info("===== isConfigMap =====")
-							configMap := &v1.ConfigMap{}
-							configMap.Namespace = request.Namespace
-							dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader([]byte(b)), 1000)
-							if err := dec.Decode(&configMap); err == nil {
-								reqLogger.Info("configMap", "name", objectMeta.Name, "data", configMap.String())
-
-								aux := &v1.ConfigMap{}
-								if err := r.client.Get(context.TODO(), types.NamespacedName{Name: configMap.Name, Namespace: configMap.Namespace}, aux); err == nil {
-									if err := r.client.Update(context.TODO(), configMap); err != nil {
-										reqLogger.Info("Update ConfigMap err: " + err.Error())
-									}
-								} else {
-									if err := r.client.Create(context.TODO(), configMap); err != nil {
-										reqLogger.Info("Create ConfigMap err: " + err.Error())
-									}
-								}
-							} else {
-								reqLogger.Info("Unmarshal configMap err: " + err.Error())
-							}
+							handleConfigMap(r, reqLogger, request.Namespace, b)
 						case "Secret":
-							reqLogger.Info("===== isSecret =====")
-							secret := &v1.Secret{}
-							if err := yaml.Unmarshal([]byte(b), &secret); err == nil {
-								reqLogger.Info("secret", "name", secret.Name, "data", secret.Data)
-							} else {
-								reqLogger.Info("Unmarshal secret err: " + err.Error())
-							}
+							handleSecret(r, reqLogger, request.Namespace, b)
+						case "Deployment":
+							handleDeployment(r, reqLogger, request.Namespace, b)
+						case "DeploymentConfig":
+							handleDeploymentConfig(r, reqLogger, request.Namespace, b)
+						case "ImageStream":
+							handleImageStream(r, reqLogger, request.Namespace, b)
+						case "BuildConfig":
+							handleBuildConfig(r, reqLogger, request.Namespace, b)
+						case "Route":
+							handleRoute(r, reqLogger, request.Namespace, b)
+						case "Service":
+							handleService(r, reqLogger, request.Namespace, b)
 						default:
 							reqLogger.Info("===== isOther =====" + kind)
 						}
@@ -285,53 +290,265 @@ func applyAllFilesInFolder(r *ReconcileConfiguration, request reconcile.Request,
 	}
 
 	return nil
-
-	/*u := &unstructured.Unstructured{}
-	u.Object = map[string]interface{}{
-		"name":      "name",
-		"namespace": "namespace",
-		"spec": map[string]interface{}{
-			"replicas": 2,
-			"selector": map[string]interface{}{
-				"matchLabels": map[string]interface{}{
-					"foo": "bar",
-				},
-			},
-			"template": map[string]interface{}{
-				"labels": map[string]interface{}{
-					"foo": "bar",
-				},
-				"spec": map[string]interface{}{
-					"containers": []map[string]interface{}{
-						{
-							"name":  "nginx",
-							"image": "nginx",
-						},
-					},
-				},
-			},
-		},
-	}
-	u.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "apps",
-		Kind:    "Deployment",
-		Version: "v1",
-	})
-	_ = c.Create(context.Background(), u)*/
-
-	/*ctx := context.TODO()
-	err := r.client.List(ctx, opts, configmapList)
-
-	if err := r.client.Create(context.TODO(), pod); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	return err*/
 }
 
-func NVL(str string, def string) string {
+func nvl(str string, def string) string {
 	if len(str) == 0 {
 		return def
 	}
 	return str
+}
+
+func hash(buffer []byte) string {
+	hasher := md5.New()
+	hasher.Write(buffer)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func hashMapOfBytes(m map[string]byte) (string, error) {
+	b := new(bytes.Buffer)
+	e := gob.NewEncoder(b)
+
+	err := e.Encode(m)
+	if err != nil {
+		return "", err
+	}
+
+	return hash(b.Bytes()), nil
+}
+
+func hashMapOfString(m map[string]string) (string, error) {
+	b := new(bytes.Buffer)
+	e := gob.NewEncoder(b)
+
+	err := e.Encode(m)
+	if err != nil {
+		return "", err
+	}
+
+	return hash(b.Bytes()), nil
+}
+
+func handleConfigMap(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== ConfigMap =====")
+	fromK8s := &v1.ConfigMap{}
+	fromFile := &v1.ConfigMap{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+
+			// Check if we have to update or not...
+			logger.Info("+++++++++ 1 +++++++++ checkIfUpdateConfigMap")
+			areEqual := checkIfUpdateConfigMap(fromFile, fromK8s)
+			logger.Info("+++++++++ 2 +++++++++ checkIfUpdateConfigMap >>>>>> " + strconv.FormatBool(areEqual) + " <<<<<<<")
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update ConfigMap err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create ConfigMap err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal ConfigMap err: " + err.Error())
+	}
+
+	return err
+}
+
+func checkIfUpdateConfigMap(fromFile *v1.ConfigMap, fromK8s *v1.ConfigMap) bool {
+	logger := log.WithValues("Struc", "ConfigMap")
+	type intersection struct {
+		Labels      map[string]string
+		Annotations map[string]string
+		Data        map[string]string
+		BinaryData  map[string][]byte
+	}
+
+	src := &intersection{fromFile.Labels, fromFile.Annotations, fromFile.Data, fromFile.BinaryData}
+	des := &intersection{fromK8s.Labels, fromK8s.Annotations, fromK8s.Data, fromK8s.BinaryData}
+
+	if diff := cmp.Diff(src, des); diff != "" {
+		logger.Info(fmt.Sprintf("mismatch (-want +got):\n%s", diff))
+	}
+
+	return cmp.Equal(src, des, nil)
+}
+
+func handleSecret(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== Secret =====")
+	fromK8s := &v1.Secret{}
+	fromFile := &v1.Secret{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update Secret err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create Secret err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal Secret err: " + err.Error())
+	}
+
+	return err
+}
+
+func handleDeployment(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== Deployment =====")
+	fromK8s := &appsv1.Deployment{}
+	fromFile := &appsv1.Deployment{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update Deployment err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create Deployment err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal Secret err: " + err.Error())
+	}
+
+	return err
+}
+
+func handleDeploymentConfig(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== DeploymentConfig =====")
+	fromK8s := &oappsv1.DeploymentConfig{}
+	fromFile := &oappsv1.DeploymentConfig{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update DeploymentConfig err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create DeploymentConfig err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal DeploymentConfig err: " + err.Error())
+	}
+
+	return err
+}
+
+func handleImageStream(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== ImageStream =====")
+	fromK8s := &imagev1.ImageStream{}
+	fromFile := &imagev1.ImageStream{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update ImageStream err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create ImageStream err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal ImageStream err: " + err.Error())
+	}
+
+	return err
+}
+
+func handleBuildConfig(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== BuildConfig =====")
+	fromK8s := &buildv1.BuildConfig{}
+	fromFile := &buildv1.BuildConfig{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update BuildConfig err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create BuildConfig err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal BuildConfig err: " + err.Error())
+	}
+
+	return err
+}
+
+func handleRoute(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== Route =====")
+	fromK8s := &routev1.Route{}
+	fromFile := &routev1.Route{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update Route err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create Route err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal Route err: " + err.Error())
+	}
+
+	return err
+}
+
+func handleService(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
+	logger.Info("===== Service =====")
+	fromK8s := &corev1.Service{}
+	fromFile := &corev1.Service{}
+	fromFile.Namespace = namespace
+	dec := k8s_yaml.NewYAMLOrJSONDecoder(bytes.NewReader(buffer), 1000)
+	var err error
+	if err = dec.Decode(&fromFile); err == nil {
+		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
+			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update Service err: " + err.Error())
+			}
+		} else {
+			if err = r.client.Create(context.TODO(), fromFile); err != nil {
+				logger.Info("Create Service err: " + err.Error())
+			}
+		}
+	} else {
+		logger.Info("Unmarshal Service err: " + err.Error())
+	}
+
+	return err
 }

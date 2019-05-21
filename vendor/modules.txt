@@ -81,6 +81,12 @@ github.com/golang/protobuf/protoc-gen-go/generator/internal/remap
 github.com/golang/protobuf/protoc-gen-go/plugin
 # github.com/google/btree v0.0.0-20180813153112-4030bb1f1f0c
 github.com/google/btree
+# github.com/google/go-cmp v0.3.0
+github.com/google/go-cmp/cmp
+github.com/google/go-cmp/cmp/internal/diff
+github.com/google/go-cmp/cmp/internal/flags
+github.com/google/go-cmp/cmp/internal/function
+github.com/google/go-cmp/cmp/internal/value
 # github.com/google/gofuzz v0.0.0-20170612174753-24818f796faf
 github.com/google/gofuzz
 # github.com/google/uuid v1.0.0
@@ -131,6 +137,13 @@ github.com/mitchellh/go-homedir
 github.com/modern-go/concurrent
 # github.com/modern-go/reflect2 v1.0.1
 github.com/modern-go/reflect2
+# github.com/openshift/api v3.9.0+incompatible
+github.com/openshift/api/apps/v1
+github.com/openshift/api/build/v1
+github.com/openshift/api/image/v1
+github.com/openshift/api/route/v1
+github.com/openshift/api/image/docker10
+github.com/openshift/api/image/dockerpre012
 # github.com/operator-framework/operator-sdk v0.8.1-0.20190517223317-f7f644008098
 github.com/operator-framework/operator-sdk/pkg/k8sutil
 github.com/operator-framework/operator-sdk/pkg/leader
@@ -370,11 +383,12 @@ gopkg.in/warnings.v0
 # gopkg.in/yaml.v2 v2.2.2
 gopkg.in/yaml.v2
 # k8s.io/api v0.0.0-20190222213804-5cb15d344471 => k8s.io/api v0.0.0-20181213150558-05914d821849
+k8s.io/api/apps/v1
 k8s.io/api/core/v1
+k8s.io/api/extensions/v1beta1
 k8s.io/api/rbac/v1
 k8s.io/api/admissionregistration/v1alpha1
 k8s.io/api/admissionregistration/v1beta1
-k8s.io/api/apps/v1
 k8s.io/api/apps/v1beta1
 k8s.io/api/apps/v1beta2
 k8s.io/api/auditregistration/v1alpha1
@@ -391,7 +405,6 @@ k8s.io/api/batch/v2alpha1
 k8s.io/api/certificates/v1beta1
 k8s.io/api/coordination/v1beta1
 k8s.io/api/events/v1beta1
-k8s.io/api/extensions/v1beta1
 k8s.io/api/networking/v1
 k8s.io/api/policy/v1beta1
 k8s.io/api/rbac/v1alpha1
@@ -412,6 +425,7 @@ k8s.io/apimachinery/pkg/apis/meta/v1
 k8s.io/apimachinery/pkg/runtime/schema
 k8s.io/apimachinery/pkg/api/errors
 k8s.io/apimachinery/pkg/types
+k8s.io/apimachinery/pkg/util/yaml
 k8s.io/apimachinery/pkg/util/wait
 k8s.io/apimachinery/pkg/apis/meta/v1/unstructured
 k8s.io/apimachinery/pkg/util/intstr
@@ -434,7 +448,6 @@ k8s.io/apimachinery/pkg/version
 k8s.io/apimachinery/pkg/runtime/serializer/streaming
 k8s.io/apimachinery/pkg/util/net
 k8s.io/apimachinery/pkg/apis/meta/v1beta1
-k8s.io/apimachinery/pkg/util/yaml
 k8s.io/apimachinery/pkg/util/validation
 k8s.io/apimachinery/pkg/util/clock
 k8s.io/apimachinery/pkg/util/strategicpatch
