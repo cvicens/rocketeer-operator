@@ -9,7 +9,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"strconv"
+
+	"k8s.io/apimachinery/pkg/util/json"
 
 	cmp "github.com/google/go-cmp/cmp"
 
@@ -30,6 +31,7 @@ import (
 	imagev1 "github.com/openshift/api/image/v1"
 	routev1 "github.com/openshift/api/route/v1"
 
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	k8s_yaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -329,6 +331,51 @@ func hashMapOfString(m map[string]string) (string, error) {
 	return hash(b.Bytes()), nil
 }
 
+func diff(original, modified runtime.Object) ([]byte, error) {
+	origBytes, err := json.Marshal(original)
+	if err != nil {
+		return nil, err
+	}
+
+	modBytes, err := json.Marshal(modified)
+	if err != nil {
+		return nil, err
+	}
+
+	return strategicpatch.CreateTwoWayMergePatch(origBytes, modBytes, original)
+}
+
+func calculateMergePatchBytes(original, modified runtime.Object, dataStruct interface{}) ([]byte, error) {
+	patchBytes, err := diff(original, modified)
+	if err != nil {
+		return nil, err
+	}
+	origBytes, err := json.Marshal(original)
+	if err != nil {
+		return nil, err
+	}
+
+	obj, err := strategicpatch.StrategicMergePatch(origBytes, patchBytes, dataStruct)
+	if err != nil {
+		return nil, err
+	}
+	return obj, nil
+}
+
+// Returns calculated merge patch in dataStruct
+func calculateMergePatchObject(original, modified runtime.Object, dataStruct interface{}) error {
+	mergePatchBytes, err := calculateMergePatchBytes(original, modified, dataStruct)
+	if err != nil {
+		return err
+	}
+
+	if err = json.Unmarshal(mergePatchBytes, dataStruct); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func handleConfigMap(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
 	logger.Info("===== ConfigMap =====")
 	fromK8s := &v1.ConfigMap{}
@@ -339,14 +386,21 @@ func handleConfigMap(r *ReconcileConfiguration, logger logr.Logger, namespace st
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
-
-			// Check if we have to update or not...
-			logger.Info("+++++++++ 1 +++++++++ checkIfUpdateConfigMap")
-			areEqual := checkIfUpdateConfigMap(fromFile, fromK8s)
-			logger.Info("+++++++++ 2 +++++++++ checkIfUpdateConfigMap >>>>>> " + strconv.FormatBool(areEqual) + " <<<<<<<")
-			if err = r.client.Update(context.TODO(), fromFile); err != nil {
-				logger.Info("Update ConfigMap err: " + err.Error())
+			mergedPatchObject := &v1.ConfigMap{}
+			patchError := calculateMergePatchObject(fromK8s, fromFile, mergedPatchObject)
+			if patchError == nil {
+				if err = r.client.Update(context.TODO(), mergedPatchObject); err != nil {
+					logger.Info("Update ConfigMap err: " + err.Error())
+				}
+			} else {
+				logger.Info("=======> patchError: " + patchError.Error())
 			}
+
+			/*if checkIfUpdateConfigMap(fromFile, fromK8s) {
+				if err = r.client.Update(context.TODO(), fromFile); err != nil {
+					logger.Info("Update ConfigMap err: " + err.Error())
+				}
+			}*/
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
 				logger.Info("Create ConfigMap err: " + err.Error())
@@ -360,7 +414,7 @@ func handleConfigMap(r *ReconcileConfiguration, logger logr.Logger, namespace st
 }
 
 func checkIfUpdateConfigMap(fromFile *v1.ConfigMap, fromK8s *v1.ConfigMap) bool {
-	logger := log.WithValues("Struc", "ConfigMap")
+	logger := log.WithValues("Struct", "ConfigMap")
 	type intersection struct {
 		Labels      map[string]string
 		Annotations map[string]string
@@ -388,8 +442,10 @@ func handleSecret(r *ReconcileConfiguration, logger logr.Logger, namespace strin
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
-			if err = r.client.Update(context.TODO(), fromFile); err != nil {
-				logger.Info("Update Secret err: " + err.Error())
+			if checkIfUpdateSecret(fromFile, fromK8s) {
+				if err = r.client.Update(context.TODO(), fromFile); err != nil {
+					logger.Info("Update Secret err: " + err.Error())
+				}
 			}
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
@@ -401,6 +457,26 @@ func handleSecret(r *ReconcileConfiguration, logger logr.Logger, namespace strin
 	}
 
 	return err
+}
+
+func checkIfUpdateSecret(fromFile *v1.Secret, fromK8s *v1.Secret) bool {
+	logger := log.WithValues("Struct", "Secret")
+	type intersection struct {
+		Labels      map[string]string
+		Annotations map[string]string
+		Data        map[string][]byte
+		StringData  map[string]string
+		Type        v1.SecretType
+	}
+
+	src := &intersection{fromFile.Labels, fromFile.Annotations, fromFile.Data, fromFile.StringData, fromFile.Type}
+	des := &intersection{fromK8s.Labels, fromK8s.Annotations, fromK8s.Data, fromK8s.StringData, fromK8s.Type}
+
+	if diff := cmp.Diff(src, des); diff != "" {
+		logger.Info(fmt.Sprintf("mismatch (-want +got):\n%s", diff))
+	}
+
+	return cmp.Equal(src, des, nil)
 }
 
 func handleDeployment(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
@@ -438,9 +514,11 @@ func handleDeploymentConfig(r *ReconcileConfiguration, logger logr.Logger, names
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
+			//if checkIfUpdateDeploymentConfig(fromFile, fromK8s) {
 			if err = r.client.Update(context.TODO(), fromFile); err != nil {
 				logger.Info("Update DeploymentConfig err: " + err.Error())
 			}
+			//}
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
 				logger.Info("Create DeploymentConfig err: " + err.Error())
@@ -451,6 +529,24 @@ func handleDeploymentConfig(r *ReconcileConfiguration, logger logr.Logger, names
 	}
 
 	return err
+}
+
+func checkIfUpdateDeploymentConfig(fromFile *oappsv1.DeploymentConfig, fromK8s *oappsv1.DeploymentConfig) bool {
+	logger := log.WithValues("Struct", "Secret")
+	type intersection struct {
+		Labels      map[string]string
+		Annotations map[string]string
+		Spec        oappsv1.DeploymentConfigSpec
+	}
+
+	src := &intersection{fromFile.Labels, fromFile.Annotations, fromFile.Spec}
+	des := &intersection{fromK8s.Labels, fromK8s.Annotations, fromK8s.Spec}
+
+	if diff := cmp.Diff(src, des); diff != "" {
+		logger.Info(fmt.Sprintf("mismatch (-want +got):\n%s", diff))
+	}
+
+	return cmp.Equal(src, des, nil)
 }
 
 func handleImageStream(r *ReconcileConfiguration, logger logr.Logger, namespace string, buffer []byte) error {
