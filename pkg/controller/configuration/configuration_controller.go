@@ -45,9 +45,12 @@ import (
 
 	git "gopkg.in/src-d/go-git.v4"
 	plumbing "gopkg.in/src-d/go-git.v4/plumbing"
+
+	objectmatch "github.com/cvicens/rocketeer-operator/pkg/objectmatcher"
 )
 
 var log = logf.Log.WithName("controller_configuration")
+var objectMatcher := objectmatch.New(log)
 
 const GIT_LOCAL_FOLDER = "./tmp"
 const DEFAULT_DESCRIPTORS_FOLDER = "k8s"
@@ -246,16 +249,13 @@ func applyDescriptorsInFolder(r *ReconcileConfiguration, request reconcile.Reque
 
 	if files, err := ioutil.ReadDir(folder); err == nil {
 		for _, f := range files {
-			reqLogger.Info("current file: " + f.Name())
+			reqLogger.Info("===================== Current file: " + f.Name() + " =====================")
 			if b, err := ioutil.ReadFile(folder + f.Name()); err == nil {
 				typeMeta := &metav1.TypeMeta{}
 				if err := yaml.Unmarshal([]byte(b), &typeMeta); err == nil {
-					reqLogger.Info("typeMeta: " + typeMeta.String())
-
 					objectMeta := &metav1.ObjectMeta{}
 					if err := yaml.Unmarshal([]byte(b), &objectMeta); err == nil {
 						objectMeta.Namespace = request.Namespace
-						reqLogger.Info("objectMeta: " + objectMeta.String())
 						switch kind := typeMeta.GetObjectKind().GroupVersionKind().Kind; kind {
 						case "ConfigMap":
 							handleConfigMap(r, reqLogger, request.Namespace, b)
@@ -346,6 +346,8 @@ func diff(original, modified runtime.Object) ([]byte, error) {
 }
 
 func calculateMergePatchBytes(original, modified runtime.Object, dataStruct interface{}) ([]byte, error) {
+	logger := log.WithValues()
+
 	patchBytes, err := diff(original, modified)
 	if err != nil {
 		return nil, err
@@ -354,6 +356,8 @@ func calculateMergePatchBytes(original, modified runtime.Object, dataStruct inte
 	if err != nil {
 		return nil, err
 	}
+
+	logger.Info(fmt.Sprintf("diff (-want +got):\n%s", patchBytes))
 
 	obj, err := strategicpatch.StrategicMergePatch(origBytes, patchBytes, dataStruct)
 	if err != nil {
@@ -386,20 +390,27 @@ func handleConfigMap(r *ReconcileConfiguration, logger logr.Logger, namespace st
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
-			mergedPatchObject := &v1.ConfigMap{}
-			patchError := calculateMergePatchObject(fromK8s, fromFile, mergedPatchObject)
-			if patchError == nil {
-				if err = r.client.Update(context.TODO(), mergedPatchObject); err != nil {
-					logger.Info("Update ConfigMap err: " + err.Error())
+			if matched, err := objectMatcher.Match(fromK8s, fromFile); err == nil {
+				if !matched {
+					mergedPatchObject := &v1.ConfigMap{}
+					patchError := calculateMergePatchObject(fromK8s, fromFile, mergedPatchObject)
+					if patchError == nil {
+						logger.Info("Updating with: " + mergedPatchObject.String())
+						if err = r.client.Update(context.TODO(), mergedPatchObject); err != nil {
+							logger.Info("Update ConfigMap err: " + err.Error())
+						}
+					} else {
+						logger.Info("=======> patchError: " + patchError.Error())
+					}
+				} else {
+					logger.Info("------------> ConfigMap intact!")
 				}
 			} else {
-				logger.Info("=======> patchError: " + patchError.Error())
+				logger.Info("=======> MatchError: " + err.Error())
 			}
 
 			/*if checkIfUpdateConfigMap(fromFile, fromK8s) {
-				if err = r.client.Update(context.TODO(), fromFile); err != nil {
-					logger.Info("Update ConfigMap err: " + err.Error())
-				}
+
 			}*/
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
@@ -413,7 +424,7 @@ func handleConfigMap(r *ReconcileConfiguration, logger logr.Logger, namespace st
 	return err
 }
 
-func checkIfUpdateConfigMap(fromFile *v1.ConfigMap, fromK8s *v1.ConfigMap) bool {
+func checkIfUpdateConfigMap(fromFile, fromK8s *v1.ConfigMap) bool {
 	logger := log.WithValues("Struct", "ConfigMap")
 	type intersection struct {
 		Labels      map[string]string
@@ -442,11 +453,23 @@ func handleSecret(r *ReconcileConfiguration, logger logr.Logger, namespace strin
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
-			if checkIfUpdateSecret(fromFile, fromK8s) {
+
+			mergedPatchObject := &v1.Secret{}
+			patchError := calculateMergePatchObject(fromK8s, fromFile, mergedPatchObject)
+			if patchError == nil {
+				logger.Info("Updating with: " + mergedPatchObject.String())
+				if err = r.client.Update(context.TODO(), mergedPatchObject); err != nil {
+					logger.Info("Update Secret err: " + err.Error())
+				}
+			} else {
+				logger.Info("=======> patchError: " + patchError.Error())
+			}
+
+			/*if checkIfUpdateSecret(fromFile, fromK8s) {
 				if err = r.client.Update(context.TODO(), fromFile); err != nil {
 					logger.Info("Update Secret err: " + err.Error())
 				}
-			}
+			}*/
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
 				logger.Info("Create Secret err: " + err.Error())
@@ -489,9 +512,21 @@ func handleDeployment(r *ReconcileConfiguration, logger logr.Logger, namespace s
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
-			if err = r.client.Update(context.TODO(), fromFile); err != nil {
-				logger.Info("Update Deployment err: " + err.Error())
+
+			mergedPatchObject := &appsv1.Deployment{}
+			patchError := calculateMergePatchObject(fromK8s, fromFile, mergedPatchObject)
+			if patchError == nil {
+				logger.Info("Updating with: " + mergedPatchObject.String())
+				if err = r.client.Update(context.TODO(), mergedPatchObject); err != nil {
+					logger.Info("Update Deployment err: " + err.Error())
+				}
+			} else {
+				logger.Info("=======> patchError: " + patchError.Error())
 			}
+
+			/*if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update Deployment err: " + err.Error())
+			}*/
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
 				logger.Info("Create Deployment err: " + err.Error())
@@ -514,11 +549,24 @@ func handleDeploymentConfig(r *ReconcileConfiguration, logger logr.Logger, names
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
-			//if checkIfUpdateDeploymentConfig(fromFile, fromK8s) {
-			if err = r.client.Update(context.TODO(), fromFile); err != nil {
-				logger.Info("Update DeploymentConfig err: " + err.Error())
+
+			mergedPatchObject := &oappsv1.DeploymentConfig{}
+			patchError := calculateMergePatchObject(fromK8s, fromFile, mergedPatchObject)
+			logger.Info("DC mergedPatchObject: " + mergedPatchObject.String())
+			if patchError == nil {
+				logger.Info("Updating with: " + mergedPatchObject.String())
+				if err = r.client.Update(context.TODO(), mergedPatchObject); err != nil {
+					logger.Info("Update DeploymentConfig err: " + err.Error())
+				}
+			} else {
+				logger.Info("=======> patchError: " + patchError.Error())
 			}
-			//}
+
+			/*if checkIfUpdateDeploymentConfig(fromFile, fromK8s) {
+				if err = r.client.Update(context.TODO(), fromFile); err != nil {
+					logger.Info("Update DeploymentConfig err: " + err.Error())
+				}
+			}*/
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
 				logger.Info("Create DeploymentConfig err: " + err.Error())
@@ -559,9 +607,22 @@ func handleImageStream(r *ReconcileConfiguration, logger logr.Logger, namespace 
 	if err = dec.Decode(&fromFile); err == nil {
 		if err = r.client.Get(context.TODO(), types.NamespacedName{Name: fromFile.Name, Namespace: fromFile.Namespace}, fromK8s); err == nil {
 			fromFile.ObjectMeta.ResourceVersion = fromK8s.ObjectMeta.ResourceVersion
-			if err = r.client.Update(context.TODO(), fromFile); err != nil {
-				logger.Info("Update ImageStream err: " + err.Error())
+
+			mergedPatchObject := &imagev1.ImageStream{}
+			patchError := calculateMergePatchObject(fromK8s, fromFile, mergedPatchObject)
+			logger.Info("DC mergedPatchObject: " + mergedPatchObject.String())
+			if patchError == nil {
+				logger.Info("Updating with: " + mergedPatchObject.String())
+				if err = r.client.Update(context.TODO(), mergedPatchObject); err != nil {
+					logger.Info("Update DeploymentConfig err: " + err.Error())
+				}
+			} else {
+				logger.Info("=======> patchError: " + patchError.Error())
 			}
+
+			/*if err = r.client.Update(context.TODO(), fromFile); err != nil {
+				logger.Info("Update ImageStream err: " + err.Error())
+			}*/
 		} else {
 			if err = r.client.Create(context.TODO(), fromFile); err != nil {
 				logger.Info("Create ImageStream err: " + err.Error())
